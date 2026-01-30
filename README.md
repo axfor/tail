@@ -43,3 +43,26 @@ and fixing bugs.
 
 ## Examples
 Examples, e.g. used to debug an issue, are kept in the [examples directory](/examples).
+
+## Page Cache Control
+
+When tailing many files in memory-constrained environments (e.g. Kubernetes pods),
+the OS page cache can grow unbounded and cause OOM kills. The `DropPageCache` option
+advises the kernel to release cached pages after reading, keeping memory usage stable.
+
+```Go
+t, err := tail.TailFile("/var/log/app.log", tail.Config{
+    Follow:        true,
+    ReOpen:        true,
+    DropPageCache: true,
+})
+```
+
+When enabled, the following optimizations are applied:
+
+| Platform | Mechanism | Effect |
+|----------|-----------|--------|
+| Linux | `fadvise(FADV_SEQUENTIAL)` | Hints sequential access for better readahead and eviction |
+| Linux | `fcntl(O_NOATIME)` | Suppresses access-time updates to reduce inode writeback |
+| Linux, FreeBSD, NetBSD | `fadvise(FADV_DONTNEED)` | Evicts read pages from the page cache (every 64KB, at EOF, and on close) |
+| macOS | `fcntl(F_NOCACHE)` | Bypasses the unified buffer cache entirely |

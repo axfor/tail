@@ -1,3 +1,19 @@
+# Version v1.4.12
+* Add `DropPageCache` config option to control OS page cache memory usage.
+  When enabled, advises the kernel to release cached pages after reading,
+  preventing OOM kills in memory-constrained environments (e.g. Kubernetes pods).
+  - Linux/FreeBSD/NetBSD: uses `posix_fadvise(FADV_DONTNEED)` to evict read
+    pages (every 64KB, at EOF, and on file close), and `FADV_SEQUENTIAL` to
+    hint sequential access at file open.
+  - Linux: uses `fcntl(O_NOATIME)` to suppress access-time updates, reducing
+    inode writeback overhead when tailing many files.
+  - macOS: uses `fcntl(F_NOCACHE)` to bypass the unified buffer cache entirely.
+  - Other platforms: no-op.
+* Bump minimum Go version to 1.23.
+* Migrate build tags from `// +build` to `//go:build` syntax.
+* Add `golang.org/x/sys` as a direct dependency for `posix_fadvise` and
+  `fcntl` syscall wrappers.
+
 # Version v1.4.11
 * Bump fsnotify to v1.6.0. Should fix some issues.
 
