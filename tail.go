@@ -81,6 +81,12 @@ type Config struct {
 	MaxLineSize   int  // If non-zero, split longer lines into multiple lines
 	CompleteLines bool // Only return complete lines (that end with "\n" or EOF when Follow is false)
 
+	// DropPageCache advises the OS to drop file data from the page cache
+	// after reading. This reduces memory pressure in environments like
+	// Kubernetes pods where page cache counts toward the container's
+	// memory limit. Only effective on Linux, FreeBSD, and NetBSD.
+	DropPageCache bool
+
 	// Optionally, use a ratelimiter (e.g. created by the ratelimiter/NewLeakyBucket function)
 	RateLimiter *ratelimiter.LeakyBucket
 
@@ -99,6 +105,9 @@ type Tail struct {
 	lineNum int
 
 	lineBuf *strings.Builder
+
+	lastDropOffset     int64
+	bytesReadSinceDrop int64
 
 	watcher watch.FileWatcher
 	changes *watch.FileChanges
@@ -152,6 +161,10 @@ func TailFile(filename string, config Config) (*Tail, error) {
 		if err != nil {
 			return nil, err
 		}
+		if t.DropPageCache {
+			initPageCacheControl(t.file)
+			setNoAtime(t.file)
+		}
 	}
 
 	go t.tailFileSync()
@@ -203,6 +216,7 @@ func (tail *Tail) close() {
 
 func (tail *Tail) closeFile() {
 	if tail.file != nil {
+		tail.tryDropPageCache()
 		tail.file.Close()
 		tail.file = nil
 	}
@@ -214,6 +228,8 @@ func (tail *Tail) reopen() error {
 	}
 	tail.closeFile()
 	tail.lineNum = 0
+	tail.lastDropOffset = 0
+	tail.bytesReadSinceDrop = 0
 	for {
 		var err error
 		tail.file, err = OpenFile(tail.Filename)
@@ -229,6 +245,10 @@ func (tail *Tail) reopen() error {
 				continue
 			}
 			return fmt.Errorf("Unable to open file %s: %s", tail.Filename, err)
+		}
+		if tail.DropPageCache {
+			initPageCacheControl(tail.file)
+			setNoAtime(tail.file)
 		}
 		break
 	}
@@ -308,6 +328,12 @@ func (tail *Tail) tailFileSync() {
 
 		// Process `line` even if err is EOF.
 		if err == nil {
+			if tail.DropPageCache {
+				tail.bytesReadSinceDrop += int64(len(line))
+				if tail.bytesReadSinceDrop >= dropPageCacheThreshold {
+					tail.tryDropPageCache()
+				}
+			}
 			cooloff := !tail.sendLine(line)
 			if cooloff {
 				// Wait a second before seeking till the end of
@@ -340,6 +366,9 @@ func (tail *Tail) tailFileSync() {
 					return
 				}
 			}
+
+			// Drop page cache before blocking on file changes.
+			tail.tryDropPageCache()
 
 			// When EOF is reached, wait for more data to become
 			// available. Wait strategy is based on the `tail.watcher`
@@ -412,6 +441,24 @@ func (tail *Tail) waitForChanges() error {
 	case <-tail.Dying():
 		return ErrStop
 	}
+}
+
+const dropPageCacheThreshold = 64 * 1024 // 64KB
+
+// tryDropPageCache advises the OS to release cached pages for data
+// that has already been read from the file.
+func (tail *Tail) tryDropPageCache() {
+	if !tail.DropPageCache || tail.file == nil {
+		return
+	}
+	pos, err := tail.Tell()
+	if err != nil || pos <= tail.lastDropOffset {
+		tail.bytesReadSinceDrop = 0
+		return
+	}
+	dropPageCacheRange(tail.file, tail.lastDropOffset, pos-tail.lastDropOffset)
+	tail.lastDropOffset = pos
+	tail.bytesReadSinceDrop = 0
 }
 
 func (tail *Tail) openReader() {
